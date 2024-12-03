@@ -484,8 +484,38 @@ def _rows_per_page(data, selement, has_nulls=True, page_size=None):
     return int(page_size // (bytes_per_element + 0.125 * has_nulls))
 
 
+def _page_offsets(data, selement, has_nulls=True, page_size=None):
+    rows_per_page = _rows_per_page(data, selement, has_nulls, page_size)
+    row_offsets = list(range(0, len(data), rows_per_page)) + [len(data)]
+    return row_offsets
+
+
+def _cdc_offsets(data, selement, has_nulls, avg_chunk_size):
+    from fastcdc import fastcdc
+
+    if avg_chunk_size is True:
+        avg_chunk_size = 2**20
+    else:
+        avg_chunk_size = int(avg_chunk_size)
+
+    # Get the size of the original data type in bytes
+    dtype_size = data.values.dtype.itemsize  # Size of one element in bytes
+
+    # Get the raw memory buffer
+    buffer = memoryview(data.values.view(np.uint8))
+
+    # Process using fastcdc
+    chunks = fastcdc(buffer, avg_size=avg_chunk_size)
+
+    # Convert the chunk indexes from byte-level to original type level
+    for chunk in chunks:
+        yield chunk.offset // dtype_size
+    yield len(data)
+    
+
+
 def write_column(f, data0, selement, compression=None, datapage_version=None,
-                 stats=True):
+                 stats=True, cdc=False, page_size=None):
     """
     Write a single column of data to an open Parquet file
 
@@ -523,11 +553,15 @@ def write_column(f, data0, selement, compression=None, datapage_version=None,
     diff = 0
     max, min = None, None
     column_chunk_start = f.tell()
-    rows_per_page = _rows_per_page(data0, selement, has_nulls)
-    row_offsets = list(range(0, len(data0), rows_per_page)) + [len(data0)]
+    if cdc is False:
+        row_offsets = _page_offsets(data0, selement, has_nulls, page_size)
+    else:    
+        row_offsets = list(_cdc_offsets(data0, selement, has_nulls, avg_chunk_size=cdc))
     global_num_nulls = 0
     dict_page_offset = None
     data_page_offset = column_chunk_start
+
+    print("Row offsets: ", row_offsets)
 
     # column global stats
     if isinstance(data0.dtype, pd.CategoricalDtype) and stats:
@@ -762,7 +796,7 @@ class DataFrameSizeWarning(UserWarning):
     pass
 
 
-def make_row_group(f, data, schema, compression=None, stats=True):
+def make_row_group(f, data, schema, compression=None, stats=True, cdc=False, page_size=None):
     """ Make a single row group of a Parquet file """
     rows = len(data)
     if rows == 0:
@@ -803,7 +837,7 @@ def make_row_group(f, data, schema, compression=None, stats=True):
             else:
                 st = column.name in stats
             chunk = write_column(f, coldata, column,
-                                 compression=comp, stats=st)
+                                 compression=comp, stats=st, cdc=cdc, page_size=page_size)
             cols.append(chunk)
     rg = ThriftObject.from_fields(
         "RowGroup", num_rows=rows, columns=cols,
@@ -812,13 +846,13 @@ def make_row_group(f, data, schema, compression=None, stats=True):
 
 
 def make_part_file(f, data, schema, compression=None, fmd=None,
-                   stats=True):
+                   stats=True, cdc=False, page_size=None):
     if len(data) == 0:
         return
     with f as f:
         f.write(MARKER)
         rg = make_row_group(f, data, schema, compression=compression,
-                            stats=stats)
+                            stats=stats, cdc=cdc, page_size=page_size)
         if fmd is None:
             fmd = parquet_thrift.FileMetaData(num_rows=rg.num_rows,
                                               schema=schema,
@@ -938,7 +972,7 @@ def make_metadata(data, has_nulls=True, ignore_columns=None, fixed_text=None,
 
 def write_simple(fn, data, fmd, row_group_offsets=None, compression=None,
                  open_with=default_open, has_nulls=None, append=False,
-                 stats=True):
+                 stats=True, cdc=False, page_size=None):
     """
     Write to one single file (for file_scheme='simple')
 
@@ -986,7 +1020,7 @@ def write_simple(fn, data, fmd, row_group_offsets=None, compression=None,
         rgs = fmd.row_groups
         for i, row_group in enumerate(data):
             rg = make_row_group(f, row_group, fmd.schema,
-                                compression=compression, stats=stats)
+                                compression=compression, stats=stats, cdc=cdc, page_size=page_size)
             if rg is not None:
                 rgs.append(rg)
 
@@ -1006,7 +1040,7 @@ def write_simple(fn, data, fmd, row_group_offsets=None, compression=None,
 
 def write_multi(dn, data, fmd, row_group_offsets=None, compression=None,
                 file_scheme='hive', write_fmd=True, open_with=default_open,
-                mkdirs=None, partition_on=[], append=False, stats=True):
+                mkdirs=None, partition_on=[], append=False, stats=True, cdc=False, page_size=None):
     """Write to separate parquet files.
     
     Write data following `file_scheme='hive'`, `'drill'` or `'flat'`.
@@ -1081,7 +1115,7 @@ def write_multi(dn, data, fmd, row_group_offsets=None, compression=None,
             with open_with(partname, 'wb') as f2:
                 rg = make_part_file(f2, row_group, fmd.schema,
                                     compression=compression, fmd=fmd,
-                                    stats=stats)
+                                    stats=stats, cdc=cdc, page_size=page_size)
             for chunk in rg.columns:
                 chunk.file_path = part
             rg_list.append(rg)
@@ -1136,7 +1170,7 @@ def write(filename, data, row_group_offsets=None,
           mkdirs=None, has_nulls=True, write_index=None,
           partition_on=[], fixed_text=None, append=False,
           object_encoding='infer', times='int64',
-          custom_metadata=None, stats="auto"):
+          custom_metadata=None, stats="auto", cdc=False, page_size=None):
     """Write pandas dataframe to filename with parquet format.
 
     Parameters
@@ -1300,7 +1334,7 @@ def write(filename, data, row_group_offsets=None,
         pf.write_row_groups(data, row_group_offsets, sort_key=None,
                             sort_pnames=False, compression=compression,
                             write_fmd=True, open_with=open_with,
-                            mkdirs=mkdirs, stats=stats)
+                            mkdirs=mkdirs, stats=stats, cdc=cdc, page_size=page_size)
     else:
         # Case 'append=False'.
         # Define 'index_cols' to be recorded in metadata.
@@ -1343,7 +1377,7 @@ def write(filename, data, row_group_offsets=None,
             write_simple(filename, data, fmd,
                          row_group_offsets=row_group_offsets,
                          compression=compression, open_with=open_with,
-                         has_nulls=None, append=False, stats=stats)
+                         has_nulls=None, append=False, stats=stats, cdc=cdc, page_size=page_size)
         else:
             # Case 'hive', 'drill'
             write_multi(filename, data, fmd,
@@ -1351,7 +1385,7 @@ def write(filename, data, row_group_offsets=None,
                         compression=compression, file_scheme=file_scheme,
                         write_fmd=True, open_with=open_with,
                         mkdirs=mkdirs, partition_on=partition_on,
-                        append=False, stats=stats)
+                        append=False, stats=stats, cdc=cdc, page_size=page_size)
 
 
 def find_max_part(row_groups):
@@ -1496,7 +1530,7 @@ def merge(file_list, verify_schema=True, open_with=default_open,
 
 def overwrite(dirpath, data, row_group_offsets=None, sort_pnames:bool=True,
               compression=None, open_with=default_open, mkdirs=None,
-              remove_with=None, stats=True):
+              remove_with=None, stats=True, cdc=False, page_size=None):
     """Merge new data to existing parquet dataset.
 
     This function requires existing data on disk, written with 'hive' format.
@@ -1595,7 +1629,7 @@ def overwrite(dirpath, data, row_group_offsets=None, sort_pnames:bool=True,
     pf.write_row_groups(data, row_group_offsets=row_group_offsets,
                         sort_key=sort_key, compression=compression,
                         write_fmd=False, open_with=open_with, mkdirs=mkdirs,
-                        stats=stats)
+                        stats=stats, cdc=cdc, page_size=page_size)
     pf.remove_row_groups(rgs_to_remove, sort_pnames=sort_pnames,
                          write_fmd=True, open_with=open_with,
                          remove_with=remove_with)
